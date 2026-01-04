@@ -27,5 +27,11 @@ ts.tv_nsec = (long)(next_ns % 1000000000LL);
 // Absolute sleep to avoid drift
 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
 
+int64_t actual_now = now_ns();
+if (actual_now > next_ns + 2000000LL) { // > 2ms late
+    fprintf(stderr, "WARNING: Laminar loop drift detected (%ld us late)\n", 
+            (long)((actual_now - next_ns) / 1000));
+}
+
 next_ns += 1000000LL; // +1ms
 }

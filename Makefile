@@ -1,4 +1,4 @@
-CC=gcc
+CC?=gcc
 CHPL=chpl
 
 CFLAGS=-O3 -std=c11 -Wall -Wextra -Werror -pthread

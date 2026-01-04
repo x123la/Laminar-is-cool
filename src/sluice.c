@@ -26,8 +26,9 @@ typedef struct {
 } pktmeta;
 
 static pktmeta ring[MAX_PACKETS];
-static atomic_uint head = 0;
-static atomic_uint tail = 0;
+// Simplify Concurrency Model: Single-threaded consumer/producer in poll_thread
+static unsigned head = 0;
+static unsigned tail = 0;
 
 static atomic_llong pressure_bytes = 0;
 static atomic_llong inflow_bytes = 0;
@@ -62,48 +63,44 @@ static int cb(struct nfq_q_handle* qh_, struct nfgenmsg* nfmsg,
   (void)payload;
   if (len < 0) len = 0;
 
-atomic_fetch_add(&inflow_bytes, (int64_t)len);
+  atomic_fetch_add(&inflow_bytes, (int64_t)len);
 
-unsigned t = atomic_load_explicit(&tail, memory_order_relaxed);
-unsigned h_ = atomic_load_explicit(&head, memory_order_acquire);
-unsigned nt = next_idx(t);
+  unsigned t = tail;
+  unsigned h_ = head;
+  unsigned nt = next_idx(t);
 
-// Ring full -> fail open (immediate accept)
-if (nt == h_) {
-nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-return 0;
-}
+  // Ring full -> fail open (immediate accept)
+  if (nt == h_) {
+    nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    return 0;
+  }
 
-ring[t].id = id;
-ring[t].len = (uint32_t)len;
-ring[t].t_enqueue_ns = now_ns();
+  ring[t].id = id;
+  ring[t].len = (uint32_t)len;
+  ring[t].t_enqueue_ns = now_ns();
 
-atomic_store_explicit(&tail, nt, memory_order_release);
-atomic_fetch_add(&pressure_bytes, (int64_t)len);
-return 0; // delayed verdict (stored)
+  tail = nt;
+  atomic_fetch_add(&pressure_bytes, (int64_t)len);
+  return 0; // delayed verdict (stored)
 }
 
 static void release_fifo_bytes(int64_t budget_bytes) {
   if (budget_bytes <= 0) return;
 
-  unsigned h0 = atomic_load_explicit(&head, memory_order_relaxed);
-  unsigned t0 = atomic_load_explicit(&tail, memory_order_acquire);
-  if (h0 == t0) return;
+  if (head == tail) return;
 
   int64_t released = 0;
   uint32_t last_id = 0;
-  unsigned hcur = h0;
+  unsigned hcur = head;
+  unsigned t = tail;
   pktmeta* prev_pkt = NULL;
 
-  while (hcur != t0 && released < budget_bytes) {
+  while (hcur != t && released < budget_bytes) {
     pktmeta* p = &ring[hcur];
     
-    // Detect ID wrap-around (packet ID dropped significantly)
-    // If wrapped, we MUST flush the pre-wrap batch first.
+    // Detect ID wrap-around
     if (prev_pkt && p->id < prev_pkt->id) {
        nfq_set_verdict_batch(qh, prev_pkt->id, NF_ACCEPT);
-       // We only released up to prev_pkt. The current packet p (low ID) is NOT released yet.
-       // We reset last_id so we don't try to batch-release it again with the wrong ID logic.
        last_id = 0; 
     }
 
@@ -114,55 +111,100 @@ static void release_fifo_bytes(int64_t budget_bytes) {
   }
 
   if (last_id != 0) {
-    // Batch accept: all queued packets with id <= last_id
     nfq_set_verdict_batch(qh, last_id, NF_ACCEPT);
   }
   
   if (released > 0) {
-    atomic_store_explicit(&head, hcur, memory_order_release);
+    head = hcur;
     atomic_fetch_sub(&pressure_bytes, released);
     if (atomic_load(&pressure_bytes) < 0) atomic_store(&pressure_bytes, 0);
-    
-    // Subtract used budget from the accumulator
     atomic_fetch_sub(&release_budget, released);
   }
 }
 
 static void release_overdue(void) {
-  for (;;) {
-    unsigned h0 = atomic_load_explicit(&head, memory_order_relaxed);
-    unsigned t0 = atomic_load_explicit(&tail, memory_order_acquire);
-    if (h0 == t0) return;
+  if (head == tail) return;
+  
+  // Optimization: Find the youngest packet that is overdue
+  // Then release everything up to it in one batch.
+  int64_t now = now_ns();
+  unsigned hcur = head;
+  unsigned t = tail;
+  unsigned h_last_overdue = hcur; // Default to no move if head isn't overdue (check loop)
+  uint32_t last_id = 0;
+  int64_t released_bytes = 0;
+  int found_overdue = 0;
 
-    if ((now_ns() - ring[h0].t_enqueue_ns) < MAX_DELAY_NS) return;
+  // We scan forward until we find a packet that is NOT overdue
+  while (hcur != t) {
+      if ((now - ring[hcur].t_enqueue_ns) < MAX_DELAY_NS) {
+          // This packet is young enough. Stop.
+          break;
+      }
+      // This packet is overdue.
+      h_last_overdue = hcur;
+      last_id = ring[hcur].id;
+      released_bytes += ring[hcur].len;
+      hcur = next_idx(hcur);
+      found_overdue = 1;
+  }
 
-    uint32_t id = ring[h0].id;
-    int64_t len = (int64_t)ring[h0].len;
-    unsigned h1 = next_idx(h0);
+  if (found_overdue) {
+      // release_fifo_bytes handles ID wrapping for normal generic release.
+      // Here we need to be careful too. Or we can just reuse the batch concept.
+      // If we see ID drop during scan, we should have flushed.
+      // Complex optimization: strict scan for wrap needed?
+      // Simpler approach for reliability:
+      // Just release_fifo_bytes with a "virtual" budget equal to released_bytes?
+      // No, we want to target specific ID.
+      // Let's rely on batch behavior: release up to last_id.
+      // Implicitly handles previous ones assuming no wrap between head and last_id.
+      // If there IS a wrap, batch might fail for the pre-wrap ones if kernel checks ID > last_ID?
+      // Actually, nfq_set_verdict_batch releases packet_id <= ID.
+      // If we have 100, 101, ... 255, 0, 1, 2... and we want to release up to 2.
+      // Batch(2) might release 0, 1, 2, but 100..255 are > 2, so they stay?
+      // YES. Wrap-around breaks simple batching.
+      
+      // Re-scan for wrap-around to be safe
+      unsigned scan = head;
+      pktmeta* prev = NULL;
+      uint32_t batch_target = 0;
+      
+      while (scan != hcur) { // iterate explicitly through the overdue range
+          if (prev && ring[scan].id < prev->id) {
+             // Wrapped. Flush up to prev.
+             nfq_set_verdict_batch(qh, prev->id, NF_ACCEPT);
+          }
+          batch_target = ring[scan].id;
+          prev = &ring[scan];
+          scan = next_idx(scan);
+      }
+      
+      // Final flush
+      if (batch_target != 0) {
+          nfq_set_verdict_batch(qh, batch_target, NF_ACCEPT);
+      }
 
-    // Release overdue packet via batch up to its id (it is the head)
-    // Note: Overdue release is one-by-one (head only), so wrap-around within a batch isn't an issue here 
-    // unless we were batching multiple overdue packets. The original code does one by one.
-    nfq_set_verdict_batch(qh, id, NF_ACCEPT);
-    atomic_store_explicit(&head, h1, memory_order_release);
-    atomic_fetch_sub(&pressure_bytes, len);
-    if (atomic_load(&pressure_bytes) < 0) atomic_store(&pressure_bytes, 0);
+      // Update state
+      head = hcur;
+      atomic_fetch_sub(&pressure_bytes, released_bytes);
+      if (atomic_load(&pressure_bytes) < 0) atomic_store(&pressure_bytes, 0);
   }
 }
 
 static void* poll_thread(void* arg) {
   (void)arg;
-  // Bug fix: Increase buffer to avoid truncation of Jumbo frames / GSO
   unsigned char buf[65536] __attribute__((aligned));
 
   struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
 
   while (atomic_load(&running)) {
-    // Wake every 1ms
     int pr = poll(&pfd, 1, 1);
 
     if (pr > 0 && (pfd.revents & POLLIN)) {
-      for (;;) {
+      // Fix Starvation: Burst limit
+      int burst = 64;
+      while (burst-- > 0) {
         int rv = recv(fd, buf, sizeof(buf), 0);
         if (rv < 0) {
           if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -174,22 +216,12 @@ static void* poll_thread(void* arg) {
 
     release_overdue();
 
-    // Consume budget: check what is available
     int64_t budget = atomic_load(&release_budget);
     release_fifo_bytes(budget);
   }
 
-  // Fail-open flush on shutdown
   for (;;) {
-    unsigned h0 = atomic_load(&head);
-    unsigned t0 = atomic_load(&tail);
-    if (h0 == t0) break;
-    // For flush, we can use a huge budget
-    // But we need to be careful about wrap-around if we reuse release_fifo_bytes logic
-    // The modified release_fifo_bytes handles wrap-around, so we can just call it.
-    // However, release_fifo_bytes now subtracts from release_budget.
-    // For shutdown flush, we just want to drain.
-    // Let's manually drain or just cheat the budget.
+    if (head == tail) break;
     atomic_store(&release_budget, 1LL << 60);
     release_fifo_bytes(1LL << 60);
   }
@@ -217,13 +249,8 @@ int sluice_init(uint16_t queue_num) {
     return -2;
   }
   
-  // Bug fix: Configure kernel queue length to match user ring
   if (nfq_set_queue_maxlen(qh, MAX_PACKETS) < 0) {
       fprintf(stderr, "nfq_set_queue_maxlen failed\n");
-      // Continue anyway or fail? "MUST fail-open". 
-      // Analysis says "Fatal Logic Error". Proceeding with warning or return error?
-      // Let's fail initialization so user checks it.
-      // Actually, standard behavior if permissions/caps are missing.
   }
 
   nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff);
@@ -237,6 +264,10 @@ int sluice_init(uint16_t queue_num) {
   atomic_store(&inflow_bytes, 0);
   atomic_store(&release_budget, 0);
   atomic_store(&running, 1);
+  
+  // Reset ring state
+  head = 0;
+  tail = 0;
 
   if (pthread_create(&thr, NULL, poll_thread, NULL) != 0) {
     fprintf(stderr, "pthread_create failed\n");
@@ -259,7 +290,6 @@ int64_t sluice_get_inflow_bytes_and_reset(void) {
 
 void sluice_set_release_budget_bytes(int64_t bytes) {
   if (bytes < 0) bytes = 0;
-  // Bug fix: Accumulative budget
   atomic_fetch_add(&release_budget, bytes);
 }
 
@@ -270,3 +300,4 @@ void sluice_shutdown(void) {
   if (h) nfq_close(h);
   qh = NULL; h = NULL; fd = -1;
 }
+
