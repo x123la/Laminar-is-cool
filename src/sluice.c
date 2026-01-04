@@ -14,14 +14,15 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 #define MAX_PACKETS 16384
 #define MAX_DELAY_NS 25000000LL // 25ms hard deadline
 
 typedef struct {
-uint32_t id;
-uint32_t len;
-int64_t t_enqueue_ns;
+  uint32_t id;
+  uint32_t len;
+  int64_t t_enqueue_ns;
 } pktmeta;
 
 static pktmeta ring[MAX_PACKETS];
@@ -40,25 +41,26 @@ static int fd = -1;
 static pthread_t thr;
 
 static inline int64_t now_ns(void) {
-struct timespec ts;
-clock_gettime(CLOCK_MONOTONIC, &ts);
-return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
 static inline unsigned next_idx(unsigned i) { return (i + 1u) % MAX_PACKETS; }
 
 static int cb(struct nfq_q_handle* qh_, struct nfgenmsg* nfmsg,
-struct nfq_data* nfa, void* data) {
-(void)qh_; (void)nfmsg; (void)data;
+              struct nfq_data* nfa, void* data) {
+  (void)qh_; (void)nfmsg; (void)data;
 
-struct nfqnl_msg_packet_hdr* ph = nfq_get_msg_packet_hdr(nfa);
-if (!ph) return 0;
+  struct nfqnl_msg_packet_hdr* ph = nfq_get_msg_packet_hdr(nfa);
+  if (!ph) return 0;
 
-uint32_t id = ntohl(ph->packet_id);
+  uint32_t id = ntohl(ph->packet_id);
 
-unsigned char* payload = NULL;
-int len = nfq_get_payload(nfa, &payload); // correct usage: pass pointer
-if (len < 0) len = 0;
+  unsigned char* payload = NULL;
+  int len = nfq_get_payload(nfa, &payload); // correct usage: pass pointer
+  (void)payload;
+  if (len < 0) len = 0;
 
 atomic_fetch_add(&inflow_bytes, (int64_t)len);
 

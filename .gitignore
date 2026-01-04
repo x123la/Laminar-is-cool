@@ -1,0 +1,8 @@
+/laminar
+/*.o
+/*.a
+/*.so
+/*.dylib
+/*.exe
+/build/
+/dist/
