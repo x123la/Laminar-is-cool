@@ -28,9 +28,17 @@ ts.tv_nsec = (long)(next_ns % 1000000000LL);
 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
 
 int64_t actual_now = now_ns();
-if (actual_now > next_ns + 2000000LL) { // > 2ms late
+int64_t lag = actual_now - next_ns;
+
+if (lag > 2000000LL) { // > 2ms late
     fprintf(stderr, "WARNING: Laminar loop drift detected (%ld us late)\n", 
-            (long)((actual_now - next_ns) / 1000));
+            (long)(lag / 1000));
+
+    // Safety valve: if we are > 50ms behind, skip ticks to recover (Death Spiral prevention)
+    if (lag > 50000000LL) {
+          fprintf(stderr, "WARNING: Lag > 50ms. Resyncing clock to prevent starvation.\n");
+          next_ns = actual_now;
+    }
 }
 
 next_ns += 1000000LL; // +1ms
