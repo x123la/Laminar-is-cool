@@ -17,7 +17,7 @@ return x;
 
 proc main() {
 // ---- Constants (EXACT) ----
-const N: int = 64;
+const N: int = 50;
 const DT: real = 0.001; // 1000 Hz
 const dx: real = 1.0 / (N:real - 1.0);
 const invDx: real = 1.0 / dx;
@@ -25,7 +25,7 @@ const invDx2: real = 1.0 / (dx*dx);
 
 const B: real = 32.0 * 1024.0 * 1024.0; // reservoir capacity bytes
 const RHO_TARGET: real = 0.35;
-const U_MAX: real = 20.0;
+const U_MAX: real = 18.0;
 
 // ---- State ----
 var nu: real = 0.02; // start viscosity
@@ -57,8 +57,8 @@ const u_in = clamp(inflowBytes / (B * DT), 0.0, U_MAX);
 u[0] = u_in;
 
 // 3) Viscous Burgers update (upwind convection, central diffusion)
-//    Interior points 1..N-2
-forall i in 1..N-2 {
+//    Sequential loop to avoid 1ms parallel task launch overhead
+for i in 1..N-2 {
   const ui = u[i];
 
   // Upwind du/dx depending on sign of ui (ui is non-negative here, but keep exact)

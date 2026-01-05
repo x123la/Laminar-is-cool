@@ -1,45 +1,54 @@
 #include "tick.h"
-
 #include <time.h>
-#include <stdint.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-static int64_t next_ns = 0;
+static struct timespec next_ts;
+static int initialized = 0;
 
-static inline int64_t now_ns(void) {
-struct timespec ts;
-clock_gettime(CLOCK_MONOTONIC, &ts);
-return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static void panic(const char* msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
 }
 
-void tick_init_1khz(void) {
-int64_t n = now_ns();
-// Next tick aligned to the next millisecond boundary
-next_ns = (n / 1000000LL + 1) * 1000000LL;
-}
-
-void tick_wait_next(void) {
-if (next_ns == 0) tick_init_1khz();
-
-struct timespec ts;
-ts.tv_sec = (time_t)(next_ns / 1000000000LL);
-ts.tv_nsec = (long)(next_ns % 1000000000LL);
-
-// Absolute sleep to avoid drift
-clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
-
-int64_t actual_now = now_ns();
-int64_t lag = actual_now - next_ns;
-
-if (lag > 2000000LL) { // > 2ms late
-    fprintf(stderr, "WARNING: Laminar loop drift detected (%ld us late)\n", 
-            (long)(lag / 1000));
-
-    // Safety valve: if we are > 50ms behind, skip ticks to recover (Death Spiral prevention)
-    if (lag > 50000000LL) {
-          fprintf(stderr, "WARNING: Lag > 50ms. Resyncing clock to prevent starvation.\n");
-          next_ns = actual_now;
+static inline void timespec_add_ns(struct timespec *ts, long ns) {
+    ts->tv_nsec += ns;
+    while (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
     }
 }
 
-next_ns += 1000000LL; // +1ms
+void tick_init_1khz(void) {
+    if (clock_gettime(CLOCK_MONOTONIC, &next_ts) == -1) {
+        panic("tick_init: clock_gettime failed");
+    }
+    // Snap to next millisecond edge for clean alignment
+    long current_ns = next_ts.tv_nsec;
+    long remainder = current_ns % 1000000L;
+    long wait_ns = 1000000L - remainder;
+    timespec_add_ns(&next_ts, wait_ns);
+    initialized = 1;
+}
+
+void tick_wait_next(void) {
+    if (!initialized) tick_init_1khz();
+
+    // Advance target by 1ms
+    timespec_add_ns(&next_ts, 1000000L);
+
+    while (1) {
+        int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_ts, NULL);
+        if (rc == 0) {
+            break;
+        } else if (rc == EINTR) {
+            // Interrupted by signal, retry with same absolute deadline
+            continue;
+        } else {
+            // EINVAL or EOPNOTSUPP - fatal
+            fprintf(stderr, "clock_nanosleep failed: %d\n", rc);
+            exit(EXIT_FAILURE);
+        }
+    }
 }

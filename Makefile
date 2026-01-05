@@ -1,7 +1,7 @@
 CC?=gcc
 CHPL=chpl
 
-CFLAGS=-O3 -std=c11 -Wall -Wextra -Werror -pthread
+CFLAGS=-O3 -std=c11 -Wall -Wextra -Werror -pthread -D_POSIX_C_SOURCE=200809L
 NFQ_CFLAGS:=$(shell pkg-config --cflags libnetfilter_queue 2>/dev/null)
 NFQ_LIBS:=$(shell pkg-config --libs libnetfilter_queue 2>/dev/null)
 
